@@ -14,6 +14,7 @@ function InterviewScreen({ sessionData, onComplete }) {
   const audioChunksRef = useRef([])
   const streamRef = useRef(null)
   const timerRef = useRef(null)
+  const uploadLockedRef = useRef(false) // prevents duplicate uploads
 
   const questions = sessionData.questions || []
   const currentQuestion = questions[currentQuestionIndex]
@@ -59,21 +60,39 @@ function InterviewScreen({ sessionData, onComplete }) {
     if (!streamRef.current || recording) return
 
     audioChunksRef.current = []
+    uploadLockedRef.current = false
 
     try {
-      const mimeType = MediaRecorder.isTypeSupported('audio/webm')
-        ? 'audio/webm'
-        : 'audio/mp4'
+      const audioTracks = streamRef.current.getAudioTracks()
+      if (!audioTracks || audioTracks.length === 0) {
+        throw new Error('No audio track found.')
+      }
 
-      const mediaRecorder = new MediaRecorder(streamRef.current, {
-        mimeType,
-        audioBitsPerSecond: 128000
-      })
+      let options = {}
+      const types = [
+        'video/webm;codecs=vp9,opus',
+        'video/webm;codecs=vp8,opus',
+        'audio/webm;codecs=opus',
+        'audio/webm',
+        'audio/ogg;codecs=opus'
+      ]
 
-      mediaRecorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          audioChunksRef.current.push(event.data)
+      for (const t of types) {
+        if (MediaRecorder.isTypeSupported(t)) {
+          options.mimeType = t
+          break
         }
+      }
+
+      let mediaRecorder
+      try {
+        mediaRecorder = new MediaRecorder(streamRef.current, options)
+      } catch {
+        mediaRecorder = new MediaRecorder(streamRef.current)
+      }
+
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data.size > 0) audioChunksRef.current.push(e.data)
       }
 
       mediaRecorder.onstop = handleRecordingStop
@@ -86,7 +105,7 @@ function InterviewScreen({ sessionData, onComplete }) {
       setTimeLeft(questionTime)
 
       timerRef.current = setInterval(() => {
-        setTimeLeft((prev) => {
+        setTimeLeft(prev => {
           if (prev <= 1) {
             stopRecording()
             return 0
@@ -94,15 +113,19 @@ function InterviewScreen({ sessionData, onComplete }) {
           return prev - 1
         })
       }, 1000)
+
     } catch (error) {
-      console.error('Error starting recording:', error)
+      console.error("Recorder Error:", error)
+      alert("Recording could not start. Check microphone permissions.")
     }
   }
 
   const stopRecording = () => {
     if (mediaRecorderRef.current && recording) {
+      uploadLockedRef.current = true
       mediaRecorderRef.current.stop()
       setRecording(false)
+
       if (timerRef.current) {
         clearInterval(timerRef.current)
         timerRef.current = null
@@ -110,40 +133,79 @@ function InterviewScreen({ sessionData, onComplete }) {
     }
   }
 
-  const handleRecordingStop = async () => {
-    if (audioChunksRef.current.length === 0) return
+const handleNextQuestion = async () => {
+  uploadLockedRef.current = true;
 
-    const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' })
-    await uploadAnswer(audioBlob)
+  if (!mediaRecorderRef.current) return;
+
+  // 1. Stop recorder and WAIT for it to finish
+  const recorder = mediaRecorderRef.current;
+
+  const waitForStop = new Promise(resolve => {
+    recorder.onstop = () => {
+      resolve();
+    };
+  });
+
+  if (recording) {
+    setRecording(false);
+    recorder.stop();
   }
+
+  await waitForStop;  // <-- WAIT HERE so chunks finalize
+
+  // 2. Now check chunks
+  if (audioChunksRef.current.length === 0) {
+    const silentBlob = new Blob([], { type: "audio/webm" });
+    uploadAnswer(silentBlob);
+    return;
+  }
+
+  const mime = recorder.mimeType || "audio/webm";
+  const audioBlob = new Blob(audioChunksRef.current, { type: mime });
+
+  uploadAnswer(audioBlob);
+};
+
+
+const handleRecordingStop = async () => {
+  if (uploadLockedRef.current) {
+    uploadLockedRef.current = false;
+    return;
+  }
+
+  if (audioChunksRef.current.length === 0) return;
+
+  const mime = mediaRecorderRef.current?.mimeType || "audio/webm";
+  const audioBlob = new Blob(audioChunksRef.current, { type: mime });
+
+  await uploadAnswer(audioBlob);
+};
+
 
   const uploadAnswer = async (audioBlob) => {
     setUploading(true)
 
     try {
       const formData = new FormData()
-      formData.append('audio', audioBlob, 'answer.webm')
+      formData.append("audio", audioBlob, "answer.webm")
 
       const response = await fetch(
         `http://localhost:8000/api/upload-answer/${sessionData.session_id}/${currentQuestion.id}`,
-        {
-          method: 'POST',
-          body: formData,
-        }
+        { method: "POST", body: formData }
       )
 
-      if (!response.ok) {
-        throw new Error('Failed to upload answer')
-      }
+      if (!response.ok) throw new Error("Upload failed")
 
       if (currentQuestionIndex < questions.length - 1) {
-        setCurrentQuestionIndex(currentQuestionIndex + 1)
+        setCurrentQuestionIndex(prev => prev + 1)
       } else {
         await analyzeInterview()
       }
-    } catch (error) {
-      console.error('Error uploading answer:', error)
-      alert('Failed to upload answer. Please try again.')
+
+    } catch (err) {
+      console.error("Upload error:", err)
+      alert("Failed to upload answer.")
     } finally {
       setUploading(false)
     }
@@ -159,22 +221,20 @@ function InterviewScreen({ sessionData, onComplete }) {
         { method: 'POST' }
       )
 
-      if (!response.ok) {
-        throw new Error('Failed to analyze interview')
-      }
+      if (!response.ok) throw new Error("Analysis failed")
 
       onComplete()
     } catch (error) {
-      console.error('Error analyzing interview:', error)
-      alert('Failed to analyze interview. Please check results manually.')
+      console.error("Analysis error:", error)
+      alert("Failed to analyze. Check backend.")
       onComplete()
     }
   }
 
   const formatTime = (seconds) => {
-    const mins = Math.floor(seconds / 60)
-    const secs = seconds % 60
-    return `${mins}:${secs.toString().padStart(2, '0')}`
+    const m = Math.floor(seconds / 60)
+    const s = String(seconds % 60).padStart(2, "0")
+    return `${m}:${s}`
   }
 
   return (
@@ -187,9 +247,7 @@ function InterviewScreen({ sessionData, onComplete }) {
           <div className="progress-bar">
             <div
               className="progress-fill"
-              style={{
-                width: `${((currentQuestionIndex + 1) / questions.length) * 100}%`
-              }}
+              style={{ width: `${((currentQuestionIndex + 1) / questions.length) * 100}%` }}
             />
           </div>
         </div>
@@ -197,54 +255,45 @@ function InterviewScreen({ sessionData, onComplete }) {
 
       <div className="interview-content">
         <div className="video-section">
-          <video
-            ref={videoRef}
-            autoPlay
-            playsInline
-            muted
-            className="video-feed"
-          />
+          <video ref={videoRef} autoPlay playsInline muted className="video-feed" />
+
           {recording && (
             <div className="recording-indicator">
-              <span className="recording-dot"></span>
-              Recording
+              <span className="recording-dot"></span> Recording
             </div>
           )}
+
           <div className="timer">{formatTime(timeLeft)}</div>
         </div>
 
         <div className="question-section">
+          <button
+            className="next-btn"
+            onClick={handleNextQuestion}
+            disabled={uploading || analyzing}
+          >
+            Next
+          </button>
+
           <h2 className="question-title">Your Question</h2>
           <p className="question-text">{currentQuestion?.text}</p>
 
-          {uploading && (
-            <div className="status-message">
-              Uploading your answer...
-            </div>
-          )}
-
-          {analyzing && (
-            <div className="status-message analyzing">
-              Analyzing your interview... This may take a moment.
-            </div>
-          )}
+          {uploading && <div className="status-message">Uploading your answer...</div>}
+          {analyzing && <div className="status-message analyzing">Analyzing interview...</div>}
         </div>
       </div>
 
       <div className="interview-footer">
         <div className="question-grid">
-          {questions.map((q, index) => (
+          {questions.map((q, i) => (
             <div
               key={q.id}
               className={`question-indicator ${
-                index < currentQuestionIndex
-                  ? 'completed'
-                  : index === currentQuestionIndex
-                  ? 'active'
-                  : ''
+                i < currentQuestionIndex ? "completed" :
+                i === currentQuestionIndex ? "active" : ""
               }`}
             >
-              {index + 1}
+              {i + 1}
             </div>
           ))}
         </div>
